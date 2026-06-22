@@ -10,9 +10,7 @@ wheels/
 .venv
 
 # Podaci i modeli
-data/
-artifacts/
-results/
+#data/
 
 # Python
 *$py.class
