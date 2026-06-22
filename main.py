@@ -1,5 +1,5 @@
 def main():
-    print("Hello from book-recommendations!")
+    print("Hello from film-recommendations!")
 
 
 if __name__ == "__main__":

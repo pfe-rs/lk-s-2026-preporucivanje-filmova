@@ -8,3 +8,21 @@ wheels/
 
 # Virtual environments
 .venv
+
+# Podaci i modeli
+data/
+artifacts/
+results/
+
+# Python
+*$py.class
+*.so
+.Python
+env/
+venv/
+
+# Jupyter
+.ipynb_checkpoints/
+
+# Okruženje
+.env
