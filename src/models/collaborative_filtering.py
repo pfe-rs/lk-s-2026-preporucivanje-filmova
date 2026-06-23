@@ -1,6 +1,6 @@
 import logging
 import pandas as pd
-from typing import List, Optional
+from typing import List, Optional, Tuple
 from surprise import SVD, Dataset, Reader
 
 logger = logging.getLogger(__name__)
@@ -43,7 +43,7 @@ class CollaborativeFiltering:
 
     def recommend_for_user(
         self, user_id: int, watched_movie_ids: List[int], top_n: int = 10
-    ) -> List[int]:
+    ) -> List[Tuple[int, float]]:
         if self.svd_model is None:
             raise ValueError("Model is not fitted yet. Call fit() first.")
 
@@ -62,4 +62,4 @@ class CollaborativeFiltering:
 
         predictions.sort(key=lambda x: x[1], reverse=True)
 
-        return [movie_id for movie_id, _ in predictions[:top_n]]
+        return [(movie_id, score) for movie_id, score in predictions[:top_n]]

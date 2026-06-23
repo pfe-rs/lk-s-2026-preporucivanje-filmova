@@ -158,6 +158,7 @@ class MovieLensDataLoader:
 
         genres = movie_info.iloc[0]["genres"].split("|")
         return genres
+<<<<<<< HEAD
    
 
     def fetch_single_movie(self, row):
@@ -258,3 +259,15 @@ class MovieLensDataLoader:
     #             #logger.info(f"Fetched Letterboxd data for movie ID {movie_id}: {movie.title}")
     #         except Exception as e:
     #             logger.error(f"Error fetching Letterboxd data for movie ID {movie_id}: {e}")
+=======
+
+    def get_genre_matrix(self) -> np.ndarray:
+        if self.genre_matrix is None:
+            self.preprocess_movies()
+        return self.genre_matrix
+
+    def get_movie_id_to_index(self) -> Dict[int, int]:
+        if self.movies_df is None:
+            self.load_data()
+        return {mid: idx for idx, mid in enumerate(self.movies_df["movieId"])}
+>>>>>>> 1b09a7b6da14bbaadfe3d3812ef0672ae9b1b08d
