@@ -9,6 +9,8 @@ logger = logging.getLogger(__name__)
 
 
 MOVIE_LENS_RAW_PATH = Path("data/raw/movielens/")
+
+
 class MovieLensDataLoader:
     def __init__(self, data_path: str = "ml-latest-small"):
         self.data_path = Path(MOVIE_LENS_RAW_PATH / data_path)
@@ -58,7 +60,7 @@ class MovieLensDataLoader:
         logger.info(f"Created genre matrix with shape {self.genre_matrix.shape}")
         return genre_dummies
 
-    #TODO: CHANGE THIS SHIT  
+    # TODO: CHANGE THIS SHIT
     def preprocess_tags(self) -> pd.DataFrame:
         """Preprocess tag data."""
         if self.tags_df is None:
