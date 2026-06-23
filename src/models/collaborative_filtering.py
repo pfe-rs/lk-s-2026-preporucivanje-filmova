@@ -7,6 +7,8 @@ logger = logging.getLogger(__name__)
 
 MIN_RATING = 1.0
 MAX_RATING = 5.0
+
+
 class CollaborativeFiltering:
     def __init__(self, k_components: int = 50, random_state: int = 42) -> None:
         self.n_components = k_components
@@ -14,6 +16,7 @@ class CollaborativeFiltering:
 
         self.svd_model: Optional[SVD] = None
         self.trainset = None
+        self._all_raw_movie_ids: List[int] = []
 
     def fit(self, df_ratings: pd.DataFrame) -> "CollaborativeFiltering":
         logger.info(
@@ -21,9 +24,9 @@ class CollaborativeFiltering:
         )
 
         reader = Reader(rating_scale=(MIN_RATING, MAX_RATING))
-
-        data = Dataset.load_from_df(df_ratings[["userId", "movieId", "rating"]], reader)
-
+        data = Dataset.load_from_df(
+            df_ratings[["userId", "movieId", "rating"]], reader
+        )
         self.trainset = data.build_full_trainset()
 
         self.svd_model = SVD(
@@ -31,13 +34,16 @@ class CollaborativeFiltering:
         )
         self.svd_model.fit(self.trainset)
 
+        self._all_raw_movie_ids = [
+            self.trainset.to_raw_iid(m_id) for m_id in self.trainset.all_items()
+        ]
+
         logger.info("SVD model successfully fitted.")
         return self
 
     def predict_score(self, user_id: int, movie_id: int) -> float:
         if self.svd_model is None:
             raise ValueError("Model is not fitted yet. Call fit() first.")
-
         prediction = self.svd_model.predict(user_id, movie_id)
         return float(prediction.est)
 
@@ -47,19 +53,25 @@ class CollaborativeFiltering:
         if self.svd_model is None:
             raise ValueError("Model is not fitted yet. Call fit() first.")
 
-        all_movie_ids = self.trainset.all_items()
-        all_raw_movie_ids = [self.trainset.to_raw_iid(m_id) for m_id in all_movie_ids]
-
         watched_set = set(watched_movie_ids)
         unwatched_movies = [
-            m_id for m_id in all_raw_movie_ids if m_id not in watched_set
+            m_id for m_id in self._all_raw_movie_ids if m_id not in watched_set
         ]
 
         predictions = [
             (movie_id, self.predict_score(user_id, movie_id))
             for movie_id in unwatched_movies
         ]
-
         predictions.sort(key=lambda x: x[1], reverse=True)
+        return predictions[:top_n]
 
-        return [(movie_id, score) for movie_id, score in predictions[:top_n]]
+    def predict_scores(self, user_id: int, item_ids: List[int]) -> List[float]:
+        if self.svd_model is None:
+            raise ValueError("Model is not fitted yet. Call fit() first.")
+        return [self.predict_score(user_id, mid) for mid in item_ids]
+
+    def get_top_k_recommendations(
+        self, user_id: int, watched_items: set, k: int = 10
+    ) -> List[int]:
+        recs = self.recommend_for_user(user_id, list(watched_items), top_n=k)
+        return [mid for mid, _ in recs]
