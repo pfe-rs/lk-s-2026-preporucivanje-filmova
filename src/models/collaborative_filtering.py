@@ -1,9 +1,8 @@
-import logging
 import pandas as pd
-from typing import List, Optional, Tuple
+import numpy as np
+from typing import List, Optional, Tuple, Dict, Any
 from surprise import SVD, Dataset, Reader
-
-logger = logging.getLogger(__name__)
+from sklearn.metrics.pairwise import cosine_similarity
 
 MIN_RATING = 1.0
 MAX_RATING = 5.0
@@ -19,10 +18,6 @@ class CollaborativeFiltering:
         self._all_raw_movie_ids: List[int] = []
 
     def fit(self, df_ratings: pd.DataFrame) -> "CollaborativeFiltering":
-        logger.info(
-            f"Fitting Surprise SVD model with {self.n_components} components..."
-        )
-
         reader = Reader(rating_scale=(MIN_RATING, MAX_RATING))
         data = Dataset.load_from_df(
             df_ratings[["userId", "movieId", "rating"]], reader
@@ -37,8 +32,6 @@ class CollaborativeFiltering:
         self._all_raw_movie_ids = [
             self.trainset.to_raw_iid(m_id) for m_id in self.trainset.all_items()
         ]
-
-        logger.info("SVD model successfully fitted.")
         return self
 
     def predict_score(self, user_id: int, movie_id: int) -> float:
@@ -75,3 +68,34 @@ class CollaborativeFiltering:
     ) -> List[int]:
         recs = self.recommend_for_user(user_id, list(watched_items), top_n=k)
         return [mid for mid, _ in recs]
+
+    def explain_recommendation(
+        self, movie_id: int, liked_items: set, top_n_reasons: int = 3
+    ) -> List[Dict[str, Any]]:
+        if self.svd_model is None or self.trainset is None:
+            return []
+
+        try:
+            inner_target = self.trainset.to_inner_iid(movie_id)
+        except ValueError:
+            return []
+
+        target_vector = self.svd_model.qi[inner_target].reshape(1, -1)
+        reasons = []
+
+        for liked_id in liked_items:
+            try:
+                inner_liked = self.trainset.to_inner_iid(liked_id)
+                liked_vector = self.svd_model.qi[inner_liked].reshape(1, -1)
+                
+                sim = cosine_similarity(target_vector, liked_vector)[0][0]
+                if sim > 0:
+                    reasons.append({
+                        'movie_id': liked_id,
+                        'similarity': float(sim)
+                    })
+            except ValueError:
+                continue
+
+        reasons.sort(key=lambda x: x['similarity'], reverse=True)
+        return reasons[:top_n_reasons]

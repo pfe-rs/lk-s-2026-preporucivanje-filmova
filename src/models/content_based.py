@@ -3,8 +3,8 @@ import pandas as pd
 import pickle
 import logging
 from pathlib import Path
-from typing import List, Dict, Any, Optional, Protocol
-from dataclasses import dataclass, field
+from typing import List, Dict, Any, Optional
+from dataclasses import dataclass
 from scipy.sparse import hstack, csr_matrix
 from sklearn.preprocessing import MinMaxScaler, QuantileTransformer
 from sklearn.feature_extraction.text import TfidfVectorizer
@@ -12,15 +12,13 @@ from sklearn.metrics.pairwise import cosine_similarity
 
 logger = logging.getLogger(__name__)
 
-
 @dataclass
 class ContentBasedConfig:
-    # Sum (1.0)
     main_actor_weight: float = 0.04
     director_weight: float = 0.30
     cast_weight: float = 0.10
     keywords_weight: float = 0.60
-    genre_weight:float = 0.15
+    genre_weight: float = 0.15
     numerical_weight: float = 0.30
     
     tfidf_sublinear_tf: bool = True
@@ -34,7 +32,7 @@ class ContentBasedConfig:
     
     artifacts_dir: str = "data/processed/artifacts"
     
-    fillna_strategy: str = "median"  # "median", "mean", "zero"
+    fillna_strategy: str = "median"
 
 
 class ContentBasedRecommender:    
@@ -51,6 +49,7 @@ class ContentBasedRecommender:
         self.qt_year = None
         
         self.similarity_matrix = None
+        self.feature_matrix = None
         self.movie_id_to_idx = {}
         self.idx_to_movie_id = {}
         self.all_movie_ids = set()
@@ -58,6 +57,7 @@ class ContentBasedRecommender:
         self.user_profiles = {}
         self.movie_id_to_title = {} 
         self.movie_popularity = {}
+        self.movie_vote_counts = {}
         
         self.is_fitted = False
 
@@ -79,53 +79,40 @@ class ContentBasedRecommender:
             weight = max(1, max_weight - i)
             weighted_cast.extend([actor] * weight)
         weighted_cast = ContentBasedRecommender._clean_text(weighted_cast)
-        print(f"Weighted cast: {weighted_cast}")
         return ' '.join(weighted_cast)
-    
-    # ========================================
-    # FEATURE ENGINEERING
-    # ========================================
     
     def _preprocess_numerical_features(self, df: pd.DataFrame) -> pd.DataFrame:
         df = df.copy()
         
-        # --- RUNTIME ---
         median_runtime = df["runtime"].replace(0, np.nan).median()
         df["runtime"] = df["runtime"].replace({0: median_runtime, np.nan: median_runtime})
-        
         lower_bound = df["runtime"].quantile(self.config.runtime_clip_percentiles[0])
         upper_bound = df["runtime"].quantile(self.config.runtime_clip_percentiles[1])
         df["runtime"] = df["runtime"].clip(lower_bound, upper_bound)
-        
-        # MinMaxScaler
         self.scaler_runtime = MinMaxScaler()
         df["runtime"] = self.scaler_runtime.fit_transform(df[["runtime"]])
         
-        # --- YEAR ---
         median_year = df["year"].astype(float).median()
         df["year"] = df["year"].fillna(median_year)
-        
         self.qt_year = QuantileTransformer(
             output_distribution="normal",
             n_quantiles=self.config.year_n_quantiles,
             random_state=42
         )
         year_transformed = self.qt_year.fit_transform(df[["year"]])
-        
-        # MinMaxScaler
         self.scaler_year = MinMaxScaler()
         df["year"] = self.scaler_year.fit_transform(year_transformed)
-        #--- VOTE COUNT ---
+        
         median_votes = df["vote_count"].astype(float).median()
         df["vote_count"] = df['vote_count'].fillna(median_votes)
         qt = QuantileTransformer(output_distribution='uniform')
         df["vote_count"] = qt.fit_transform(df[["vote_count"]].astype(float))
+        
         return df
     
     def _preprocess_actor_director_ratings(self, df: pd.DataFrame) -> pd.DataFrame:
         df = df.copy()
         
-        # --- MAIN ACTOR RATING ---
         if 'rating' in df.columns:
             df['main_actor_rating'] = df.groupby('main_actor')['rating'].transform('mean')
             median_rating_actor = df["main_actor_rating"].replace(0, np.nan).median()
@@ -133,8 +120,6 @@ class ContentBasedRecommender:
                 0: median_rating_actor,
                 np.nan: median_rating_actor
             })
-            
-            # Log transform + MinMaxScaler
             df["main_actor_rating"] = np.log1p(df["main_actor_rating"])
             self.scaler_main_actor_rating = MinMaxScaler()
             df["main_actor_rating"] = self.scaler_main_actor_rating.fit_transform(
@@ -143,7 +128,6 @@ class ContentBasedRecommender:
         else:
             df['main_actor_rating'] = 0.0
             
-        # --- DIRECTOR RATING ---
         if 'rating' in df.columns:
             df['director_rating'] = df.groupby('director')['rating'].transform('mean')
             median_rating_director = df["director_rating"].replace(0, np.nan).median()
@@ -151,8 +135,6 @@ class ContentBasedRecommender:
                 0: median_rating_director,
                 np.nan: median_rating_director
             })
-            
-            # Log transform + MinMaxScaler
             df["director_rating"] = np.log1p(df["director_rating"])
             self.scaler_director_rating = MinMaxScaler()
             df["director_rating"] = self.scaler_director_rating.fit_transform(
@@ -164,10 +146,6 @@ class ContentBasedRecommender:
         return df
     
     def _build_feature_matrix(self, df: pd.DataFrame) -> csr_matrix:
-        logger.info("Building feature matrix...")
-        
-        # --- TF-IDF ---
-        # Main Actor
         self.tfidf_main_actor = TfidfVectorizer(
             sublinear_tf=self.config.tfidf_sublinear_tf,
             max_features=self.config.tfidf_max_features
@@ -176,7 +154,6 @@ class ContentBasedRecommender:
             df["main_actor"].fillna("").apply(self._clean_text)
         )
         
-        # Director
         self.tfidf_director = TfidfVectorizer(
             sublinear_tf=self.config.tfidf_sublinear_tf,
             max_features=self.config.tfidf_max_features
@@ -185,7 +162,6 @@ class ContentBasedRecommender:
             df["director"].fillna("").apply(self._clean_text)
         )
         
-        # Cast
         self.tfidf_cast = TfidfVectorizer(
             sublinear_tf=self.config.tfidf_sublinear_tf,
             max_features=self.config.tfidf_max_features
@@ -203,12 +179,13 @@ class ContentBasedRecommender:
             lambda x: ' '.join(self._clean_text(x)) if isinstance(x, list) else ""
         )
         keywords_tfidf = self.tfidf_keywords.fit_transform(keywords_cleaned)
+        
         numerical_features = df[[
             'runtime', 
             'year', 
             'main_actor_rating',
-              'director_rating',
-              'vote_count'
+            'director_rating',
+            'vote_count'
         ]].values
         numerical_matrix = csr_matrix(numerical_features)
 
@@ -231,136 +208,79 @@ class ContentBasedRecommender:
             numerical_matrix
         ])
         
-        logger.info(f"Combined features shape: {combined_features.shape}")
-        logger.info(f"Non-zero elements: {combined_features.nnz}")
-        
         return combined_features
     
     def _compute_similarity_matrix(self, features: csr_matrix) -> np.ndarray:
-        logger.info("Computing cosine similarity matrix...")
-        
-        # Для очень больших матриц (>20k фильмов) нужно использовать
-        # chunking или approximate methods (LSH, Annoy)
-        if features.shape[0] > 20000:
-            logger.warning(
-                "Large dataset detected. Consider using approximate "
-                "similarity methods for production."
-            )
-        
         similarity_matrix = cosine_similarity(features)
-        
         similarity_matrix[similarity_matrix < self.config.similarity_threshold] = 0
-        
-        logger.info(f"Similarity matrix shape: {similarity_matrix.shape}")
-        logger.info(f"Non-zero similarities: {np.count_nonzero(similarity_matrix)}")
-        
         return similarity_matrix
     
-    # ========================================
-    # (RecommenderProtocol)
-    # ========================================
-    
-    from typing import Optional
-
     def fit(self, movies_df: pd.DataFrame, ratings_df: Optional[pd.DataFrame] = None) -> 'ContentBasedRecommender':
-        logger.info("Starting fit process...")
-        
-        # Проверка наличия необходимых колонок в movies_df
         required_cols = ['movieId', 'main_actor', 'director', 'cast', 'runtime', 'year', 'keywords']
         missing_cols = [col for col in required_cols if col not in movies_df.columns]
         if missing_cols:
             raise ValueError(f"Missing required columns in movies_df: {missing_cols}")
         
-        # --- ШАГИ 1-4: ОБРАБОТКА ФИЛЬМОВ И ПОСТРОЕНИЕ МАТРИЦЫ СХОДСТВА ---
-        logger.info("Step 1/5: Preprocessing numerical features...")
         df_processed = self._preprocess_numerical_features(movies_df.copy())
-        
-        logger.info("Step 2/5: Preprocessing actor/director ratings...")
-        # Используем TMDB rating для агрегации, если есть
         df_processed = self._preprocess_actor_director_ratings(df_processed)
         
-        logger.info("Step 3/5: Building feature matrix...")
         features_matrix = self._build_feature_matrix(df_processed)
         self.feature_matrix = features_matrix
-        logger.info("Step 4/5: Computing similarity matrix...")
         self.similarity_matrix = self._compute_similarity_matrix(features_matrix)
         
-        # Создание маппингов
         self.movie_id_to_idx = {
             mid: idx for idx, mid in enumerate(df_processed['movieId'].values)
         }
         self.idx_to_movie_id = {idx: mid for mid, idx in self.movie_id_to_idx.items()}
         self.all_movie_ids = set(self.movie_id_to_idx.keys())
         
-        # --- ШАГ 5: ПОСТРОЕНИЕ ПРОФИЛЕЙ ПОЛЬЗОВАТЕЛЕЙ ---
         if ratings_df is not None:
-            logger.info("Step 5/5: Building user profiles from ratings...")
             self._build_user_profiles(ratings_df)
-            
-            # Популярность на основе пользовательских оценок (для cold start)
             if 'rating' in ratings_df.columns:
                 self.movie_popularity = dict(ratings_df.groupby('movieId')['rating'].mean())
         else:
-            logger.warning("No ratings_df provided. User profiles will not be built.")
-            # Fallback на TMDB rating
             if 'rating' in movies_df.columns:
                 self.movie_popularity = dict(zip(movies_df['movieId'], movies_df['rating']))
             
-        self.is_fitted = True
-        logger.info("Fit process completed successfully!")
         self.movie_vote_counts = dict(zip(df_processed['movieId'], df_processed['vote_count']))
         if 'title' in movies_df.columns:
             self.movie_id_to_title = dict(zip(movies_df['movieId'], movies_df['title']))
-        else:
-            logger.warning("Column 'title' not found in movies_df. Titles will be unavailable.")
         
+        self.is_fitted = True
         return self
 
     def _build_user_profiles(self, ratings_df: pd.DataFrame):
         self.user_profiles = {}
-        
         good_ratings_df = ratings_df[ratings_df['rating'] >= 4.0]
         valid_df = good_ratings_df[good_ratings_df['movieId'].isin(self.movie_id_to_idx)].copy()
         
         if valid_df.empty:
-            logger.warning("No valid ratings found to build user profiles.")
             return
             
         valid_df['movie_idx'] = valid_df['movieId'].map(self.movie_id_to_idx)
         
         for user_id, group in valid_df.groupby('userId'):
             idxs = group['movie_idx'].values
-            weights = group['rating'].values  # Oblik: (K,)
+            weights = group['rating'].values
             
-            # Uzimamo sparse podmatricu za filmove koje je korisnik gledao: (K, Broj_Karakteristika)
             user_features_sparse = self.feature_matrix[idxs]
-            
-            # weights je 1D niz, pa ga transponujemo u 2D (1, K) da bi mogao da se pomnoži sa sparse matricom
-            # (1, K) x (K, Broj_Karakteristika) -> (1, Broj_Karakteristika)
             profile_sparse = csr_matrix(weights) * user_features_sparse
-            
-            # Pretvaramo samo ovaj jedan krajnji red u običan 1D NumPy niz dužine (Broj_Karakteristika,)
             profile = np.asarray(profile_sparse.todense()).reshape(-1)
             
-            # Normalizacija
             norm = np.linalg.norm(profile)
             if norm > 0:
                 profile = profile / norm
                 
             self.user_profiles[user_id] = profile
-            
-        logger.info(f"Built sparse-optimized profiles for {len(self.user_profiles)} users.")
 
     def predict_scores(self, user_id: int, item_ids: List[int]) -> List[float]:
         if not self.is_fitted:
-            raise RuntimeError("Model must be fitted before prediction. Call fit() first.")
+            raise RuntimeError("Model must be fitted before prediction.")
         
         if user_id not in self.user_profiles:
-            logger.warning(f"User {user_id} not found. Returning popularity-based scores.")
             return self._predict_popularity_scores(item_ids)
         
-        profile = self.user_profiles[user_id]  # Gusti niz oblika (Broj_Karakteristika,)
-        
+        profile = self.user_profiles[user_id]
         valid_candidates = [
             (i, mid) for i, mid in enumerate(item_ids)
             if mid in self.movie_id_to_idx
@@ -372,22 +292,14 @@ class ContentBasedRecommender:
             cand_indices = np.array([
                 self.movie_id_to_idx[mid] for _, mid in valid_candidates
             ])
-            
-            # Izvlačimo sparse matricu samo za kandidate: (Broj_Kandidata, Broj_Karakteristika)
             cand_vectors_sparse = self.feature_matrix[cand_indices]
-            
-            # Množimo sparse matricu kandidata sa gustim profilom (koristimo .dot())
-            # (Broj_Kandidata, Broj_Karakteristika) x (Broj_Karakteristika,) -> (Broj_Kandidata,)
             dots = cand_vectors_sparse.dot(profile)
             
-            # Računanje normi za kosinusnu sličnost direktno nad sparse podmatricom
-            # Pošto norm ne radi direktno na sparse po osama, računamo sumu kvadrata nenultih elemenata
             cand_norms = np.sqrt(np.asarray(cand_vectors_sparse.power(2).sum(axis=1))).reshape(-1)
             profile_norm = np.linalg.norm(profile)
-            
             norms = cand_norms * profile_norm
-            mask = norms > 0
             
+            mask = norms > 0
             valid_scores = np.zeros_like(dots)
             valid_scores[mask] = dots[mask] / norms[mask]
             
@@ -396,6 +308,7 @@ class ContentBasedRecommender:
                 pop = self.movie_vote_counts.get(_, 0.0)
                 soft_popularity = 0.35 + (0.65 * pop)
                 scores[orig_idx] = pure * soft_popularity
+                
         return scores.tolist()
     
     def _predict_popularity_scores(self, item_ids: List[int]) -> List[float]:
@@ -411,49 +324,30 @@ class ContentBasedRecommender:
         
         return scores
     
-    def get_top_k_recommendations(
-        self,
-        user_id: int,
-        watched_items: set,
-        k: int = None
-    ) -> List[int]:
+    def get_top_k_recommendations(self, user_id: int, watched_items: set, k: int = None) -> List[int]:
         if k is None:
             k = self.config.top_k_default
-        
+            
         candidate_ids = list(self.all_movie_ids - set(watched_items))
-        
         if not candidate_ids:
-            logger.warning("No candidate items available")
             return []
         
         scores = self.predict_scores(user_id, candidate_ids)
-        
         scored_items = list(zip(scores, candidate_ids))
         scored_items.sort(reverse=True, key=lambda x: x[0])
         
-        recommendations = [mid for score, mid in scored_items[:k]]
-        
-        logger.info(f"Generated {len(recommendations)} recommendations for user {user_id}")
-        
-        return recommendations
+        return [mid for score, mid in scored_items[:k]]
     
-    def get_top_k_with_titles(
-        self, 
-        user_id: int, 
-        watched_items: set, 
-        k: int = None
-    ) -> List[Dict[str, Any]]:
+    def get_top_k_with_titles(self, user_id: int, watched_items: set, k: int = None) -> List[Dict[str, Any]]:
         if k is None:
             k = self.config.top_k_default
             
         rec_ids = self.get_top_k_recommendations(user_id, watched_items, k)
-        
         scores = self.predict_scores(user_id, rec_ids)
         
         results = []
         for mid, score in zip(rec_ids, scores):
             title = self.movie_id_to_title.get(mid, 'Unknown Title')
-            
             results.append({
                 'movieId': mid,
                 'title': title,
@@ -471,7 +365,6 @@ class ContentBasedRecommender:
         top_rated_count: int = 5,
         reasons_count: int = 3
     ) -> None:
-
         movie_titles = dict(zip(movies_df['movieId'], movies_df['title']))
         
         print("=" * 80)
@@ -508,9 +401,7 @@ class ContentBasedRecommender:
         print("=" * 80)
         
         watched_items = set(user_history['movieId'].values)
-        
         liked_items = set(user_history[user_history['rating'] >= 4.0]['movieId'].values)
-        
         recommendations = self.get_top_k_with_titles(user_id, watched_items, k)
         
         if not recommendations:
@@ -559,10 +450,8 @@ class ContentBasedRecommender:
         mapping_path = mapping_path or str(artifacts_dir / "movie_id_to_idx.pkl")
         preprocessors_path = preprocessors_path or str(artifacts_dir / "preprocessors.pkl")
         
-        logger.info(f"Saving similarity matrix to {similarity_path}...")
         np.save(similarity_path, self.similarity_matrix)
         
-        logger.info(f"Saving mappings to {mapping_path}...")
         with open(mapping_path, 'wb') as f:
             pickle.dump({
                 'movie_id_to_idx': self.movie_id_to_idx,
@@ -570,7 +459,6 @@ class ContentBasedRecommender:
                 'all_movie_ids': self.all_movie_ids
             }, f)
         
-        logger.info(f"Saving preprocessors to {preprocessors_path}...")
         with open(preprocessors_path, 'wb') as f:
             pickle.dump({
                 'tfidf_main_actor': self.tfidf_main_actor,
@@ -583,8 +471,6 @@ class ContentBasedRecommender:
                 'qt_year': self.qt_year,
                 'config': self.config
             }, f)
-        
-        logger.info("All artifacts saved successfully!")
     
     def load_artifacts(
         self,
@@ -598,17 +484,14 @@ class ContentBasedRecommender:
         mapping_path = mapping_path or str(artifacts_dir / "movie_id_to_idx.pkl")
         preprocessors_path = preprocessors_path or str(artifacts_dir / "preprocessors.pkl")
         
-        logger.info(f"Loading similarity matrix from {similarity_path}...")
         self.similarity_matrix = np.load(similarity_path)
         
-        logger.info(f"Loading mappings from {mapping_path}...")
         with open(mapping_path, 'rb') as f:
             mappings = pickle.load(f)
             self.movie_id_to_idx = mappings['movie_id_to_idx']
             self.idx_to_movie_id = mappings['idx_to_movie_id']
             self.all_movie_ids = mappings['all_movie_ids']
         
-        logger.info(f"Loading preprocessors from {preprocessors_path}...")
         with open(preprocessors_path, 'rb') as f:
             preprocessors = pickle.load(f)
             self.tfidf_main_actor = preprocessors['tfidf_main_actor']
@@ -622,103 +505,13 @@ class ContentBasedRecommender:
             self.config = preprocessors['config']
         
         self.is_fitted = True
-        logger.info("All artifacts loaded successfully!")
     
-    # # ========================================
-    # # МЕТРИКИ КАЧЕСТВА
-    # # ========================================
-    
-    # def evaluate(
-    #     self,
-    #     test_df: pd.DataFrame,
-    #     k: int = 10
-    # ) -> Dict[str, float]:
-    #     """
-    #     Вычисление метрик качества на тестовой выборке.
-        
-    #     Метрики:
-    #     - Precision@K
-    #     - Recall@K
-    #     - F1@K
-    #     - NDCG@K
-    #     """
-    #     logger.info(f"Evaluating model with k={k}...")
-        
-    #     precisions = []
-    #     recalls = []
-    #     f1s = []
-    #     ndcgs = []
-        
-    #     # Группируем по пользователям
-    #     for user_id, group in test_df.groupby('userId'):
-    #         # Ground truth: фильмы с rating >= 4.0
-    #         relevant_items = set(
-    #             group[group['rating'] >= 4.0]['movieId'].values
-    #         )
-            
-    #         if not relevant_items:
-    #             continue
-            
-    #         # Все фильмы, которые пользователь оценил в train
-    #         watched_items = set(group['movieId'].values)
-            
-    #         # Генерируем рекомендации
-    #         recommendations = self.get_top_k_recommendations(
-    #             user_id, watched_items, k=k
-    #         )
-            
-    #         if not recommendations:
-    #             continue
-            
-    #         # Вычисляем метрики
-    #         hits = len(set(recommendations) & relevant_items)
-            
-    #         precision = hits / k
-    #         recall = hits / len(relevant_items) if relevant_items else 0
-    #         f1 = 2 * precision * recall / (precision + recall) if (precision + recall) > 0 else 0
-            
-    #         # NDCG
-    #         dcg = sum([
-    #             1.0 / np.log2(i + 2) if mid in relevant_items else 0.0
-    #             for i, mid in enumerate(recommendations)
-    #         ])
-    #         ideal_dcg = sum([
-    #             1.0 / np.log2(i + 2)
-    #             for i in range(min(len(relevant_items), k))
-    #         ])
-    #         ndcg = dcg / ideal_dcg if ideal_dcg > 0 else 0
-            
-    #         precisions.append(precision)
-    #         recalls.append(recall)
-    #         f1s.append(f1)
-    #         ndcgs.append(ndcg)
-        
-    #     # Усреднение
-    #     metrics = {
-    #         'precision@k': np.mean(precisions) if precisions else 0.0,
-    #         'recall@k': np.mean(recalls) if recalls else 0.0,
-    #         'f1@k': np.mean(f1s) if f1s else 0.0,
-    #         'ndcg@k': np.mean(ndcgs) if ndcgs else 0.0,
-    #         'num_users_evaluated': len(precisions)
-    #     }
-        
-    #     logger.info(f"Evaluation results: {metrics}")
-        
-    #     return metrics
-    
-    
-    def get_similar_movies(
-        self,
-        movie_id: int,
-        top_n: int = 10
-    ) -> List[Dict[str, Any]]:
+    def get_similar_movies(self, movie_id: int, top_n: int = 10) -> List[Dict[str, Any]]:
         if movie_id not in self.movie_id_to_idx:
-            logger.warning(f"Movie {movie_id} not found in matrix")
             return []
         
         movie_idx = self.movie_id_to_idx[movie_id]
         sim_scores = list(enumerate(self.similarity_matrix[movie_idx]))
-        
         sim_scores = sorted(sim_scores, key=lambda x: x[1], reverse=True)
         
         similar_movies = sim_scores[1:top_n + 1]
