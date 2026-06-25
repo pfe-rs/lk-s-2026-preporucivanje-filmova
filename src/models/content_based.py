@@ -73,11 +73,13 @@ class ContentBasedRecommender:
     def _weight_cast_members(cast_list: list, max_weight: int = 3) -> str:
         if not isinstance(cast_list, list):
             return str(cast_list) if cast_list else ""
-            
+    
         weighted_cast = []
         for i, actor in enumerate(cast_list):
             weight = max(1, max_weight - i)
             weighted_cast.extend([actor] * weight)
+        weighted_cast = ContentBasedRecommender._clean_text(weighted_cast)
+        print(f"Weighted cast: {weighted_cast}")
         return ' '.join(weighted_cast)
     
     # ========================================
