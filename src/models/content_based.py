@@ -31,7 +31,6 @@ class ContentBasedConfig:
     top_k_default: int = 10
     
     artifacts_dir: str = "data/processed/artifacts"
-    
     fillna_strategy: str = "median"
 
 
@@ -62,22 +61,22 @@ class ContentBasedRecommender:
         self.is_fitted = False
 
     @staticmethod
-    def _clean_text(x: Any) -> str:
-        if isinstance(x, list):
-            return [i.lower().replace(' ', '') for i in x if i]
-        elif isinstance(x, str):
+    def _clean_text(x: Any) -> Any:
+        if isinstance(x, str):
             return x.lower().replace(' ', '')
+        elif isinstance(x, (list, tuple, np.ndarray)):
+            return [str(i).lower().replace(' ', '') for i in x if i]
         return ""
     
     @staticmethod
-    def _weight_cast_members(cast_list: list, max_weight: int = 3) -> str:
-        if not isinstance(cast_list, list):
+    def _weight_cast_members(cast_list: Any, max_weight: int = 3) -> str:
+        if not isinstance(cast_list, (list, tuple, np.ndarray)):
             return str(cast_list) if cast_list else ""
     
         weighted_cast = []
         for i, actor in enumerate(cast_list):
             weight = max(1, max_weight - i)
-            weighted_cast.extend([actor] * weight)
+            weighted_cast.extend([str(actor)] * weight)
         weighted_cast = ContentBasedRecommender._clean_text(weighted_cast)
         return ' '.join(weighted_cast)
     
@@ -167,7 +166,7 @@ class ContentBasedRecommender:
             max_features=self.config.tfidf_max_features
         )
         cast_weighted = df["cast"].apply(
-            lambda x: self._weight_cast_members(x) if isinstance(x, list) else str(x)
+            lambda x: self._weight_cast_members(x) if isinstance(x, (list, tuple, np.ndarray)) else str(x)
         )
         cast_tfidf = self.tfidf_cast.fit_transform(cast_weighted)
 
@@ -176,7 +175,7 @@ class ContentBasedRecommender:
             max_features=self.config.tfidf_max_features
         )
         keywords_cleaned = df["keywords"].apply(
-            lambda x: ' '.join(self._clean_text(x)) if isinstance(x, list) else ""
+            lambda x: ' '.join(self._clean_text(x)) if isinstance(x, (list, tuple, np.ndarray)) else ""
         )
         keywords_tfidf = self.tfidf_keywords.fit_transform(keywords_cleaned)
         
@@ -206,14 +205,30 @@ class ContentBasedRecommender:
             keywords_tfidf,
             genre_matrix,
             numerical_matrix
-        ])
+        ]).tocsr()
         
         return combined_features
     
-    def _compute_similarity_matrix(self, features: csr_matrix) -> np.ndarray:
-        similarity_matrix = cosine_similarity(features)
-        similarity_matrix[similarity_matrix < self.config.similarity_threshold] = 0
-        return similarity_matrix
+    def _compute_similarity_matrix(self, features: csr_matrix, batch_size: int = 2000) -> csr_matrix:
+        n_samples = features.shape[0]
+        rows = []
+        cols = []
+        data = []
+        
+        for i in range(0, n_samples, batch_size):
+            end = min(i + batch_size, n_samples)
+            batch = features[i:end]
+            sim_batch = cosine_similarity(batch, features)
+            
+            sim_batch[sim_batch < self.config.similarity_threshold] = 0
+            
+            batch_rows, batch_cols = np.nonzero(sim_batch)
+            for r, c in zip(batch_rows, batch_cols):
+                rows.append(i + r)
+                cols.append(c)
+                data.append(sim_batch[r, c])
+                
+        return csr_matrix((data, (rows, cols)), shape=(n_samples, n_samples), dtype=np.float32)
     
     def fit(self, movies_df: pd.DataFrame, ratings_df: Optional[pd.DataFrame] = None) -> 'ContentBasedRecommender':
         required_cols = ['movieId', 'main_actor', 'director', 'cast', 'runtime', 'year', 'keywords']
@@ -261,10 +276,10 @@ class ContentBasedRecommender:
         
         for user_id, group in valid_df.groupby('userId'):
             idxs = group['movie_idx'].values
-            weights = group['rating'].values
+            weights = group['rating'].values.astype(np.float32)
             
             user_features_sparse = self.feature_matrix[idxs]
-            profile_sparse = csr_matrix(weights) * user_features_sparse
+            profile_sparse = csr_matrix(weights).dot(user_features_sparse)
             profile = np.asarray(profile_sparse.todense()).reshape(-1)
             
             norm = np.linalg.norm(profile)
@@ -286,7 +301,7 @@ class ContentBasedRecommender:
             if mid in self.movie_id_to_idx
         ]
         
-        scores = np.zeros(len(item_ids))
+        scores = np.zeros(len(item_ids), dtype=np.float32)
         
         if valid_candidates:
             cand_indices = np.array([
@@ -303,9 +318,9 @@ class ContentBasedRecommender:
             valid_scores = np.zeros_like(dots)
             valid_scores[mask] = dots[mask] / norms[mask]
             
-            for i, (orig_idx, _) in enumerate(valid_candidates):
+            for i, (orig_idx, mid) in enumerate(valid_candidates):
                 pure = valid_scores[i] 
-                pop = self.movie_vote_counts.get(_, 0.0)
+                pop = self.movie_vote_counts.get(mid, 0.0)
                 soft_popularity = 0.35 + (0.65 * pop)
                 scores[orig_idx] = pure * soft_popularity
                 
@@ -428,7 +443,7 @@ class ContentBasedRecommender:
                     user_rating = user_history[user_history['movieId'] == reason_id]['rating'].values
                     rating_str = f" (You rated: {user_rating[0]}/5.0)" if len(user_rating) > 0 else ""
                     
-                    print(f"       - {reason_title}{rating_str} [Similarity: {similarity:.4f}]")
+                    print(f"        - {reason_title}{rating_str} [Similarity: {similarity:.4f}]")
             else:
                 print("    (No specific reasons found in your watch history)")
                 
@@ -446,11 +461,12 @@ class ContentBasedRecommender:
         artifacts_dir = Path(self.config.artifacts_dir)
         artifacts_dir.mkdir(parents=True, exist_ok=True)
         
-        similarity_path = similarity_path or str(artifacts_dir / "similarity_matrix.npy")
+        similarity_path = similarity_path or str(artifacts_dir / "similarity_matrix.npz")
         mapping_path = mapping_path or str(artifacts_dir / "movie_id_to_idx.pkl")
         preprocessors_path = preprocessors_path or str(artifacts_dir / "preprocessors.pkl")
         
-        np.save(similarity_path, self.similarity_matrix)
+        from scipy.sparse import save_npz
+        save_npz(similarity_path, self.similarity_matrix)
         
         with open(mapping_path, 'wb') as f:
             pickle.dump({
@@ -480,11 +496,16 @@ class ContentBasedRecommender:
     ):
         artifacts_dir = Path(self.config.artifacts_dir)
         
-        similarity_path = similarity_path or str(artifacts_dir / "similarity_matrix.npy")
+        similarity_path = similarity_path or str(artifacts_dir / "similarity_matrix.npz")
         mapping_path = mapping_path or str(artifacts_dir / "movie_id_to_idx.pkl")
         preprocessors_path = preprocessors_path or str(artifacts_dir / "preprocessors.pkl")
         
-        self.similarity_matrix = np.load(similarity_path)
+        if similarity_path.endswith('.npy'):
+            dense_matrix = np.load(similarity_path, allow_pickle=True)
+            self.similarity_matrix = csr_matrix(dense_matrix)
+        else:
+            from scipy.sparse import load_npz
+            self.similarity_matrix = load_npz(similarity_path)
         
         with open(mapping_path, 'rb') as f:
             mappings = pickle.load(f)
@@ -511,16 +532,23 @@ class ContentBasedRecommender:
             return []
         
         movie_idx = self.movie_id_to_idx[movie_id]
-        sim_scores = list(enumerate(self.similarity_matrix[movie_idx]))
+        
+        row = self.similarity_matrix[movie_idx]
+        cols = row.indices
+        datas = row.data
+        
+        sim_scores = list(zip(cols, datas))
         sim_scores = sorted(sim_scores, key=lambda x: x[1], reverse=True)
         
-        similar_movies = sim_scores[1:top_n + 1]
-        
         results = []
-        for idx, score in similar_movies:
+        for idx, score in sim_scores:
+            if idx == movie_idx:
+                continue
+            if len(results) >= top_n:
+                break
             results.append({
                 'movie_id': self.idx_to_movie_id[idx],
-                'similarity': score
+                'similarity': float(score)
             })
         
         return results

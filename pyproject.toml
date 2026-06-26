@@ -13,6 +13,7 @@ dependencies = [
     "letterboxdpy",
     "matplotlib",
     "numpy",
+    "orjson>=3.11.9",
     "pandas",
     "pyarrow",
     "pydantic",

@@ -1,64 +1,77 @@
 import pandas as pd
 import numpy as np
+from scipy.sparse import coo_matrix
 from typing import List, Optional, Tuple, Dict, Any
-from surprise import SVD, Dataset, Reader
 
 MIN_RATING = 0.5
 MAX_RATING = 5.0
 
 class CollaborativeFiltering:
-    def __init__(self, k_components: int = 50, reg_all: float = 0.1, alpha: float = 0.2, min_ratings: int = 15, random_state: int = 42) -> None:
+    def __init__(
+        self, 
+        k_components: int = 50, 
+        reg_all: float = 0.02, 
+        lr_all: float = 0.005,
+        n_epochs: int = 20,
+        alpha: float = 0.2, 
+        min_ratings: int = 15, 
+        random_state: int = 42
+    ) -> None:
         self.n_components = k_components
         self.reg_all = reg_all
+        self.lr_all = lr_all
+        self.n_epochs = n_epochs
         self.alpha = alpha
         self.min_ratings = min_ratings
         self.random_state = random_state
-        self.svd_model: Optional[SVD] = None
-        self.trainset = None
-        self._all_raw_movie_ids: List[int] = []
+        
         self._raw_to_inner_user: Dict[int, int] = {}
         self._raw_to_inner_item: Dict[int, int] = {}
+        self._inner_to_raw_user: Dict[int, int] = {}
         self._inner_to_raw_item: Dict[int, int] = {}
+        
         self._pu: np.ndarray = np.array([])
         self._qi: np.ndarray = np.array([])
         self._bu: np.ndarray = np.array([])
         self._bi: np.ndarray = np.array([])
+        
         self._item_popularity: np.ndarray = np.array([])
         self._valid_item_mask: np.ndarray = np.array([])
         self._global_mean: float = 0.0
         self._popular_movies: List[int] = []
+        self._is_fitted: bool = False
 
     def fit(self, df_ratings: pd.DataFrame) -> "CollaborativeFiltering":
         popularity_series = df_ratings.groupby("movieId").size()
         filtered_popularity = popularity_series[popularity_series >= self.min_ratings]
         self._popular_movies = filtered_popularity.sort_values(ascending=False).index.tolist()
         
-        reader = Reader(rating_scale=(MIN_RATING, MAX_RATING))
-        data = Dataset.load_from_df(
-            df_ratings[["userId", "movieId", "rating"]], reader
-        )
-        self.trainset = data.build_full_trainset()
-
-        self.svd_model = SVD(
-            n_factors=self.n_components,
-            reg_all=self.reg_all,
-            random_state=self.random_state
-        )
-        self.svd_model.fit(self.trainset)
-
-        self._raw_to_inner_user = self.trainset._raw2inner_id_users
-        self._raw_to_inner_item = self.trainset._raw2inner_id_items
-        self._inner_to_raw_item = {i: r for r, i in self._raw_to_inner_item.items()}
-        self._all_raw_movie_ids = list(self._raw_to_inner_item.keys())
-
-        self._pu = self.svd_model.pu
-        self._qi = self.svd_model.qi
-        self._bu = self.svd_model.bu
-        self._bi = self.svd_model.bi
-        self._global_mean = float(self.svd_model.trainset.global_mean)
+        unique_users = df_ratings["userId"].unique()
+        unique_movies = df_ratings["movieId"].unique()
         
-        n_items = self.trainset.n_items
-        self._item_popularity = np.ones(n_items, dtype=float)
+        self._raw_to_inner_user = {raw: inner for inner, raw in enumerate(unique_users)}
+        self._raw_to_inner_item = {raw: inner for inner, raw in enumerate(unique_movies)}
+        self._inner_to_raw_user = {inner: raw for raw, inner in self._raw_to_inner_user.items()}
+        self._inner_to_raw_item = {inner: raw for raw, inner in self._raw_to_inner_item.items()}
+        
+        n_users = len(unique_users)
+        n_items = len(unique_movies)
+        
+        u_indices = df_ratings["userId"].map(self._raw_to_inner_user).values
+        i_indices = df_ratings["movieId"].map(self._raw_to_inner_item).values
+        ratings = df_ratings["rating"].values.astype(np.float32)
+        
+        sparse_coo = coo_matrix((ratings, (u_indices, i_indices)), shape=(n_users, n_items))
+        
+        self._global_mean = float(sparse_coo.data.mean())
+        
+        np.random.seed(self.random_state)
+        self._pu = np.random.normal(0, 0.1, (n_users, self.n_components))
+        self._qi = np.random.normal(0, 0.1, (n_items, self.n_components))
+        self._bu = np.zeros(n_users, dtype=np.float64)
+        self._bi = np.zeros(n_items, dtype=np.float64)
+        
+        self._item_popularity = np.ones(n_items, dtype=np.float64)
         self._valid_item_mask = np.ones(n_items, dtype=bool)
         
         for r_id, i_id in self._raw_to_inner_item.items():
@@ -66,27 +79,54 @@ class CollaborativeFiltering:
             self._item_popularity[i_id] = max(pop, 1.0)
             if pop < self.min_ratings:
                 self._valid_item_mask[i_id] = False
+
+        rows = sparse_coo.row
+        cols = sparse_coo.col
+        data = sparse_coo.data
         
+        for epoch in range(self.n_epochs):
+            indices = np.arange(len(data))
+            np.random.shuffle(indices)
+            
+            for idx in indices:
+                u = rows[idx]
+                i = cols[idx]
+                r = data[idx]
+                
+                pred = self._global_mean + self._bu[u] + self._bi[i] + np.dot(self._pu[u], self._qi[i])
+                err = r - pred
+                
+                self._bu[u] += self.lr_all * (err - self.reg_all * self._bu[u])
+                self._bi[i] += self.lr_all * (err - self.reg_all * self._bi[i])
+                
+                p_old = self._pu[u].copy()
+                self._pu[u] += self.lr_all * (err * self._qi[i] - self.reg_all * self._pu[u])
+                self._qi[i] += self.lr_all * (err * p_old - self.reg_all * self._qi[i])
+                
+        self._is_fitted = True
         return self
 
     def predict_score(self, user_id: int, movie_id: int) -> float:
-        if self.svd_model is None:
+        if not self._is_fitted:
             raise ValueError("Model is not fitted yet. Call fit() first.")
         
         u_inner = self._raw_to_inner_user.get(user_id)
         i_inner = self._raw_to_inner_item.get(movie_id)
         
         if u_inner is not None and i_inner is not None:
-            est = self._global_mean + self._bu[u_inner] + self._bi[i_inner] + float(np.dot(self._pu[u_inner], self._qi[i_inner]))
+            est = self._global_mean + self._bu[u_inner] + self._bi[i_inner] + np.dot(self._pu[u_inner], self._qi[i_inner])
             return float(np.clip(est, MIN_RATING, MAX_RATING))
-        
-        prediction = self.svd_model.predict(user_id, movie_id)
-        return float(prediction.est)
+            
+        if i_inner is not None:
+            est = self._global_mean + self._bi[i_inner]
+            return float(np.clip(est, MIN_RATING, MAX_RATING))
+            
+        return self._global_mean
 
     def recommend_for_user(
         self, user_id: int, watched_movie_ids: List[int], top_n: int = 10
     ) -> List[Tuple[int, float]]:
-        if self.svd_model is None:
+        if not self._is_fitted:
             raise ValueError("Model is not fitted yet. Call fit() first.")
 
         watched_set = set(watched_movie_ids)
@@ -124,21 +164,22 @@ class CollaborativeFiltering:
         ]
 
     def predict_scores(self, user_id: int, item_ids: List[int]) -> List[float]:
-        if self.svd_model is None:
+        if not self._is_fitted:
             raise ValueError("Model is not fitted yet. Call fit() first.")
         
         u_inner = self._raw_to_inner_user.get(user_id)
-        if u_inner is None:
-            return [float(self.svd_model.predict(user_id, mid).est) for mid in item_ids]
-            
         scores = []
+        
         for mid in item_ids:
             i_inner = self._raw_to_inner_item.get(mid)
-            if i_inner is not None:
-                est = self._global_mean + self._bu[u_inner] + self._bi[i_inner] + float(np.dot(self._pu[u_inner], self._qi[i_inner]))
+            if u_inner is not None and i_inner is not None:
+                est = self._global_mean + self._bu[u_inner] + self._bi[i_inner] + np.dot(self._pu[u_inner], self._qi[i_inner])
+                scores.append(float(np.clip(est, MIN_RATING, MAX_RATING)))
+            elif i_inner is not None:
+                est = self._global_mean + self._bi[i_inner]
                 scores.append(float(np.clip(est, MIN_RATING, MAX_RATING)))
             else:
-                scores.append(float(self.svd_model.predict(user_id, mid).est))
+                scores.append(self._global_mean)
         return scores
 
     def get_top_k_recommendations(
@@ -150,7 +191,7 @@ class CollaborativeFiltering:
     def explain_recommendation(
         self, movie_id: int, liked_items: set, top_n_reasons: int = 3
     ) -> List[Dict[str, Any]]:
-        if self.svd_model is None or self.trainset is None:
+        if not self._is_fitted:
             return []
 
         target_inner = self._raw_to_inner_item.get(movie_id)
