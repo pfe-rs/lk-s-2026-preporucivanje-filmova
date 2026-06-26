@@ -6,6 +6,7 @@ import logging
 import asyncio
 import aiohttp
 import ast
+from tqdm.asyncio import tqdm_asyncio
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -27,9 +28,11 @@ async def fetch_tmdb_movie_data(session: aiohttp.ClientSession, tmdb_id: int) ->
                 await asyncio.sleep(retry_after)
                 return await fetch_tmdb_movie_data(session, tmdb_id)
             if response.status != 200:
+                #logger.error(f"TMDB API error for tmdbId {tmdb_id}: HTTP Status {response.status}")
                 return None
             return await response.json()
-    except Exception:
+    except Exception as e:
+        #logger.error(f"Network exception for tmdbId {tmdb_id}: {str(e)}")
         return None
 
 async def process_single_row(session: aiohttp.ClientSession, row: Any, semaphore: asyncio.Semaphore) -> Optional[Dict[str, Any]]:
@@ -133,36 +136,60 @@ class MovieLensDataLoader:
         return train_ratings, test_ratings
 
     async def letterboxd_data_async(self, max_concurrent_requests: int = 100):
+        if self.links_df is None:
+            raise ValueError("Links data not loaded. Call load_data() first.")
+
+        cached_df = pd.DataFrame()
+        existing_ids = set()
+
         if self.cache_path.exists():
-            logger.info(f"Loading data from cache: {self.cache_path}")
+            logger.info(f"Loading existing data from cache: {self.cache_path}")
             cached_df = pd.read_csv(self.cache_path)
             for col in ['cast', 'keywords']:
                 if col in cached_df.columns:
-                    cached_df[col] = cached_df[col].apply(lambda x: ast.literal_eval(x) if isinstance(x, str) and x.startswith('[') else x)
-            self.movie_data = cached_df.to_dict(orient='records')
-            return
+                    cached_df[col] = cached_df[col].apply(
+                        lambda x: ast.literal_eval(x) if isinstance(x, str) and x.startswith('[') else x
+                    )
+            if "movieId" in cached_df.columns:
+                existing_ids = set(cached_df["movieId"].dropna().astype(int))
 
-        if self.links_df is None:
-            raise ValueError("Links data not loaded. Call load_data() first.")
+        missing_links = self.links_df[
+            (~self.links_df["movieId"].astype(int).isin(existing_ids)) & 
+            (self.links_df["tmdbId"].notna())
+        ]
+
+        if not missing_links.empty:
+            total_to_fetch = len(missing_links)
+            logger.info(f"Found {total_to_fetch} missing movies with valid TMDB IDs. Fetching...")
+            rows = list(missing_links.itertuples())
+            semaphore = asyncio.Semaphore(max_concurrent_requests)
+            connector = aiohttp.TCPConnector(limit=max_concurrent_requests, ttl_dns_cache=300)
             
-        rows = list(self.links_df.itertuples())
-        self.movie_data = []
-        
-        semaphore = asyncio.Semaphore(max_concurrent_requests)
-        connector = aiohttp.TCPConnector(limit=max_concurrent_requests, ttl_dns_cache=300)
-        
-        async with aiohttp.ClientSession(connector=connector) as session:
-            tasks = [process_single_row(session, row, semaphore) for row in rows]
-            results = await asyncio.gather(*tasks)
-            
-        self.movie_data = [r for r in results if r is not None]
-        
-        try:
-            self.cache_path.parent.mkdir(parents=True, exist_ok=True)
-            df_to_save = pd.DataFrame(self.movie_data)
-            df_to_save.to_csv(self.cache_path, index=False)
-        except Exception as e:
-            logger.error(f"Error saving cache to disk: {e}")
+            async with aiohttp.ClientSession(connector=connector) as session:
+                tasks = [process_single_row(session, row, semaphore) for row in rows]
+                results = await tqdm_asyncio.gather(*tasks, desc="Downloading metadata")
+                
+            new_data = [r for r in results if r is not None]
+            success_count = len(new_data)
+            failed_count = total_to_fetch - success_count
+
+            logger.info(f"DOWNLOAD SUMMARY -> Total Requested: {total_to_fetch} | Successfully Saved: {success_count} | Failed/Skipped: {failed_count}")
+
+            if new_data:
+                new_df = pd.DataFrame(new_data)
+                cached_df = pd.concat([cached_df, new_df], ignore_index=True)
+                try:
+                    self.cache_path.parent.mkdir(parents=True, exist_ok=True)
+                    cached_df.to_csv(self.cache_path, index=False)
+                    logger.info(f"Cache successfully updated and saved to {self.cache_path}")
+                except Exception as e:
+                    logger.error(f"Error saving cache to disk: {e}")
+            else:
+                logger.error("Zero movies were successfully downloaded. Check the console logs above for specific TMDB API errors.")
+        else:
+            logger.info("All movies are already cached or have missing TMDB IDs. No network requests needed.")
+
+        self.movie_data = cached_df.to_dict(orient='records')
 
     def get_genre_matrix(self) -> np.ndarray:
         if self.genre_matrix is None:
