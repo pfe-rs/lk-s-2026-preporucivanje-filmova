@@ -9,6 +9,9 @@ from scipy.sparse import hstack, csr_matrix, vstack, save_npz, load_npz
 from sklearn.preprocessing import MinMaxScaler, QuantileTransformer, normalize
 from sklearn.feature_extraction.text import TfidfVectorizer
 from concurrent.futures import ThreadPoolExecutor
+import os
+import time
+import psutil
 
 logger = logging.getLogger(__name__)
 
@@ -213,26 +216,56 @@ class ContentBasedRecommender:
         return vstack(results)
 
     def fit(self, movies_df: pd.DataFrame, ratings_df: Optional[pd.DataFrame] = None) -> 'ContentBasedRecommender':
+        """Fits the recommender model while logging execution time and memory usage."""
+        
+        # Helper function to track time and memory
+        def _log_step(step_name: str, start_time: float) -> float:
+            process = psutil.Process(os.getpid())
+            mem_mb = process.memory_info().rss / (1024 * 1024)
+            elapsed = time.time() - start_time
+            logger.info(f"[{step_name}] Completed in {elapsed:.2f}s | Current Memory: {mem_mb:.2f} MB")
+            return time.time() # Return new start time for the next step
+
+        total_start = time.time()
+        step_start = time.time()
+        logger.info("Starting model fitting process...")
+
+        # 1. Column Validation
         required_cols = ['movieId', 'main_actor', 'director', 'cast', 'runtime', 'year', 'keywords']
         missing_cols = [col for col in required_cols if col not in movies_df.columns]
         if missing_cols:
             raise ValueError(f"Missing required columns in movies_df: {missing_cols}")
+        step_start = _log_step("Validation", step_start)
         
+        # 2. Preprocessing
+        logger.info("Preprocessing numerical and categorical features...")
         df_processed = self._preprocess_numerical_features(movies_df.copy())
         df_processed = self._preprocess_actor_director_ratings(df_processed)
+        step_start = _log_step("Preprocessing", step_start)
         
+        # 3. Building Feature Matrix
+        logger.info("Building TF-IDF and combined feature matrices...")
         features_matrix = self._build_feature_matrix(df_processed)
         self.feature_matrix = features_matrix
         self.feature_matrix_norm = normalize(features_matrix, norm='l2', axis=1)
+        step_start = _log_step("Feature Matrix Generation", step_start)
         
+        # 4. Computing Similarity Matrix
+        logger.info("Computing cosine similarity matrix in batches...")
         self.similarity_matrix = self._compute_similarity_matrix(self.feature_matrix_norm)
+        step_start = _log_step("Similarity Matrix Computation", step_start)
         
+        # 5. Building Index Mappings
+        logger.info("Creating internal mapping dictionaries...")
         self.movie_id_to_idx = {
             mid: idx for idx, mid in enumerate(df_processed['movieId'].values)
         }
         self.idx_to_movie_id = {idx: mid for mid, idx in self.movie_id_to_idx.items()}
         self.all_movie_ids = set(self.movie_id_to_idx.keys())
+        step_start = _log_step("Index Mappings", step_start)
         
+        # 6. Building User Profiles & Popularity
+        logger.info("Building user profiles and calculating movie popularity...")
         if ratings_df is not None:
             self._build_user_profiles(ratings_df)
             if 'rating' in ratings_df.columns:
@@ -244,8 +277,16 @@ class ContentBasedRecommender:
         self.movie_vote_counts = dict(zip(df_processed['movieId'], df_processed['vote_count']))
         if 'title' in movies_df.columns:
             self.movie_id_to_title = dict(zip(movies_df['movieId'], movies_df['title']))
+        step_start = _log_step("User Profiles & Popularity", step_start)
         
         self.is_fitted = True
+        
+        # Final Summary
+        total_elapsed = time.time() - total_start
+        final_mem = psutil.Process(os.getpid()).memory_info().rss / (1024 * 1024)
+        logger.info(f"=== Fitting Complete! ===")
+        logger.info(f"Total Time: {total_elapsed:.2f}s | Final Memory Footprint: {final_mem:.2f} MB")
+        
         return self
 
     def _build_user_profiles(self, ratings_df: pd.DataFrame):
