@@ -9,6 +9,12 @@ import psutil
 from loguru import logger
 from src.utils.logger import LoggingConfig, StepLogger
 
+try:
+    import cupy as cp
+    HAS_GPU = True
+except ImportError:
+    HAS_GPU = False
+
 MIN_RATING = np.float32(0.5)
 MAX_RATING = np.float32(5.0)
 
@@ -17,7 +23,6 @@ def _sgd_optimize(rows, cols, data, pu, qi, bu, bi, global_mean, lr_all, reg_all
     np.random.seed(random_state)
     n_samples = len(data)
     n_factors = pu.shape[1]
-    
     for _ in range(n_epochs):
         indices = np.random.permutation(n_samples)
         for idx in indices:
@@ -42,14 +47,15 @@ def _sgd_optimize(rows, cols, data, pu, qi, bu, bi, global_mean, lr_all, reg_all
 
 class CollaborativeFiltering:
     def __init__(
-        self, 
-        k_components: int = 50, 
-        reg_all: float = 0.02, 
+        self,
+        k_components: int = 110,
+        reg_all: float = 0.02,
         lr_all: float = 0.005,
         n_epochs: int = 20,
-        alpha: float = 0.2, 
-        min_ratings: int = 15, 
+        alpha: float = 0.2,
+        min_ratings: int = 15,
         random_state: int = 42,
+        use_gpu: bool = True,
         logging_config: Optional[LoggingConfig] = None
     ) -> None:
         self.n_components = k_components
@@ -59,6 +65,7 @@ class CollaborativeFiltering:
         self.alpha = np.float32(alpha)
         self.min_ratings = min_ratings
         self.random_state = random_state
+        self.use_gpu = use_gpu
         
         self._raw_to_inner_user: Dict[int, int] = {}
         self._raw_to_inner_item: Dict[int, int] = {}
@@ -70,6 +77,14 @@ class CollaborativeFiltering:
         self._bu: np.ndarray = np.array([])
         self._bi: np.ndarray = np.array([])
         self._qi_norms: np.ndarray = np.array([])
+        
+        self._pu_gpu = None
+        self._qi_gpu = None
+        self._bu_gpu = None
+        self._bi_gpu = None
+        self._qi_norms_gpu = None
+        self._item_popularity_gpu = None
+        self._valid_item_mask_gpu = None
         
         self._item_popularity: np.ndarray = np.array([])
         self._valid_item_mask: np.ndarray = np.array([])
@@ -83,7 +98,6 @@ class CollaborativeFiltering:
     def fit(self, df_ratings: pd.DataFrame) -> "CollaborativeFiltering":
         total_start = time.perf_counter()
         total_cpu = time.process_time()
-        logger.info("Starting model fitting process")
 
         popularity_series = df_ratings["movieId"].value_counts()
         filtered_popularity = popularity_series[popularity_series >= self.min_ratings]
@@ -164,6 +178,15 @@ class CollaborativeFiltering:
         
         self._qi_norms = np.linalg.norm(self._qi, axis=1)
         self._qi_norms[self._qi_norms == 0] = 1e-9
+
+        if self.use_gpu and HAS_GPU:
+            self._pu_gpu = cp.asarray(self._pu)
+            self._qi_gpu = cp.asarray(self._qi)
+            self._bu_gpu = cp.asarray(self._bu)
+            self._bi_gpu = cp.asarray(self._bi)
+            self._qi_norms_gpu = cp.asarray(self._qi_norms)
+            self._item_popularity_gpu = cp.asarray(self._item_popularity)
+            self._valid_item_mask_gpu = cp.asarray(self._valid_item_mask)
         
         self._is_fitted = True
         self.step_logger.log_step("Finalization", total_start, total_cpu)
@@ -211,35 +234,69 @@ class CollaborativeFiltering:
             unwatched_popular = [m_id for m_id in self._popular_movies if m_id not in watched_set]
             return [(m_id, float(self._global_mean)) for m_id in unwatched_popular[:top_n]]
 
-        all_scores = self._global_mean + self._bu[u_inner] + self._bi + np.dot(self._qi, self._pu[u_inner])
-        all_scores = np.clip(all_scores, MIN_RATING, MAX_RATING)
+        if self.use_gpu and HAS_GPU:
+            all_scores = self._global_mean + self._bu_gpu[u_inner] + self._bi_gpu + cp.dot(self._qi_gpu, self._pu_gpu[u_inner])
+            all_scores = cp.clip(all_scores, MIN_RATING, MAX_RATING)
 
-        penalized_scores = all_scores / (self._item_popularity ** self.alpha)
-        mask = self._valid_item_mask.copy()
-        
-        watched_inners = [self._raw_to_inner_item[m] for m in watched_movie_ids if m in self._raw_to_inner_item]
-        if watched_inners:
-            mask[watched_inners] = False
-
-        remaining_inners = np.nonzero(mask)[0]
-        if len(remaining_inners) == 0:
-            return []
+            penalized_scores = all_scores / (self._item_popularity_gpu ** self.alpha)
+            mask = self._valid_item_mask_gpu.copy()
             
-        remaining_penalized = penalized_scores[remaining_inners]
-        top_k = min(top_n, len(remaining_penalized))
-        
-        if top_k < len(remaining_penalized):
-            partitioned_idx = np.argpartition(-remaining_penalized, top_k - 1)[:top_k]
-            sorted_top_idx = partitioned_idx[np.argsort(-remaining_penalized[partitioned_idx])]
+            watched_inners = [self._raw_to_inner_item[m] for m in watched_movie_ids if m in self._raw_to_inner_item]
+            if watched_inners:
+                mask[watched_inners] = False
+
+            remaining_inners = cp.nonzero(mask)[0]
+            if len(remaining_inners) == 0:
+                cp.get_default_memory_pool().free_all_blocks()
+                return []
+                
+            remaining_penalized = penalized_scores[remaining_inners]
+            top_k = min(top_n, len(remaining_penalized))
+            
+            if top_k < len(remaining_penalized):
+                partitioned_idx = cp.argpartition(-remaining_penalized, top_k - 1)[:top_k]
+                sorted_top_idx = partitioned_idx[cp.argsort(-remaining_penalized[partitioned_idx])]
+            else:
+                sorted_top_idx = cp.argsort(-remaining_penalized)
+                
+            final_inners = remaining_inners[sorted_top_idx].get()
+            final_scores = all_scores[final_inners].get()
+            cp.get_default_memory_pool().free_all_blocks()
+            
+            return [
+                (self._inner_to_raw_item[idx], float(final_scores[i]))
+                for i, idx in enumerate(final_inners)
+            ]
         else:
-            sorted_top_idx = np.argsort(-remaining_penalized)
+            all_scores = self._global_mean + self._bu[u_inner] + self._bi + np.dot(self._qi, self._pu[u_inner])
+            all_scores = np.clip(all_scores, MIN_RATING, MAX_RATING)
+
+            penalized_scores = all_scores / (self._item_popularity ** self.alpha)
+            mask = self._valid_item_mask.copy()
             
-        final_inners = remaining_inners[sorted_top_idx]
-        
-        return [
-            (self._inner_to_raw_item[idx], float(all_scores[idx]))
-            for idx in final_inners
-        ]
+            watched_inners = [self._raw_to_inner_item[m] for m in watched_movie_ids if m in self._raw_to_inner_item]
+            if watched_inners:
+                mask[watched_inners] = False
+
+            remaining_inners = np.nonzero(mask)[0]
+            if len(remaining_inners) == 0:
+                return []
+                
+            remaining_penalized = penalized_scores[remaining_inners]
+            top_k = min(top_n, len(remaining_penalized))
+            
+            if top_k < len(remaining_penalized):
+                partitioned_idx = np.argpartition(-remaining_penalized, top_k - 1)[:top_k]
+                sorted_top_idx = partitioned_idx[np.argsort(-remaining_penalized[partitioned_idx])]
+            else:
+                sorted_top_idx = np.argsort(-remaining_penalized)
+                
+            final_inners = remaining_inners[sorted_top_idx]
+            
+            return [
+                (self._inner_to_raw_item[idx], float(all_scores[idx]))
+                for idx in final_inners
+            ]
 
     def predict_scores(self, user_id: int, item_ids: List[int]) -> List[float]:
         if not self._is_fitted:
@@ -249,20 +306,35 @@ class CollaborativeFiltering:
         i_inners = np.array([self._raw_to_inner_item.get(mid, -1) for mid in item_ids])
         valid_mask = i_inners != -1
         
-        scores = np.full(len(item_ids), self._global_mean, dtype=np.float32)
-        
         if not np.any(valid_mask):
-            return scores.tolist()
+            return np.full(len(item_ids), self._global_mean, dtype=np.float32).tolist()
             
         valid_i = i_inners[valid_mask]
-        
-        if u_inner is not None:
-            est = self._global_mean + self._bu[u_inner] + self._bi[valid_i] + np.sum(self._pu[u_inner] * self._qi[valid_i], axis=1)
-        else:
-            est = self._global_mean + self._bi[valid_i]
+
+        if self.use_gpu and HAS_GPU:
+            scores_gpu = cp.full(len(item_ids), self._global_mean, dtype=cp.float32)
+            valid_i_gpu = cp.asarray(valid_i)
             
-        scores[valid_mask] = np.clip(est, MIN_RATING, MAX_RATING)
-        return scores.tolist()
+            if u_inner is not None:
+                est = self._global_mean + self._bu_gpu[u_inner] + self._bi_gpu[valid_i_gpu] + cp.sum(self._pu_gpu[u_inner] * self._qi_gpu[valid_i_gpu], axis=1)
+            else:
+                est = self._global_mean + self._bi_gpu[valid_i_gpu]
+                
+            valid_mask_gpu = cp.asarray(valid_mask)
+            scores_gpu[valid_mask_gpu] = cp.clip(est, MIN_RATING, MAX_RATING)
+            scores = scores_gpu.get().tolist()
+            cp.get_default_memory_pool().free_all_blocks()
+            return scores
+        else:
+            scores = np.full(len(item_ids), self._global_mean, dtype=np.float32)
+            
+            if u_inner is not None:
+                est = self._global_mean + self._bu[u_inner] + self._bi[valid_i] + np.sum(self._pu[u_inner] * self._qi[valid_i], axis=1)
+            else:
+                est = self._global_mean + self._bi[valid_i]
+                
+            scores[valid_mask] = np.clip(est, MIN_RATING, MAX_RATING)
+            return scores.tolist()
 
     def get_top_k_recommendations(
         self, user_id: int, watched_items: set, k: int = 10
@@ -284,28 +356,60 @@ class CollaborativeFiltering:
         if not liked_inners:
             return []
 
-        target_vector = self._qi[target_inner]
-        liked_vectors = self._qi[liked_inners]
+        if self.use_gpu and HAS_GPU:
+            target_vector = self._qi_gpu[target_inner]
+            liked_vectors = self._qi_gpu[liked_inners]
 
-        norm_target = self._qi_norms[target_inner]
-        norm_liked = self._qi_norms[liked_inners]
-        
-        denom = norm_liked * norm_target
-        sims = np.dot(liked_vectors, target_vector) / denom
-        
-        valid_sim_mask = sims > 0
-        valid_sims = sims[valid_sim_mask]
-        valid_inners = np.array(liked_inners)[valid_sim_mask]
-        
-        if len(valid_sims) == 0:
-            return []
+            norm_target = self._qi_norms_gpu[target_inner]
+            norm_liked = self._qi_norms_gpu[liked_inners]
             
-        sort_idx = np.argsort(-valid_sims)[:top_n_reasons]
-        
-        return [
-            {
-                'movie_id': self._inner_to_raw_item[valid_inners[idx]],
-                'similarity': float(valid_sims[idx])
-            }
-            for idx in sort_idx
-        ]
+            denom = norm_liked * norm_target
+            sims = cp.dot(liked_vectors, target_vector) / denom
+            
+            valid_sim_mask = sims > 0
+            valid_sims = sims[valid_sim_mask]
+            valid_inners_arr = cp.asarray(liked_inners)[valid_sim_mask]
+            
+            if len(valid_sims) == 0:
+                cp.get_default_memory_pool().free_all_blocks()
+                return []
+                
+            sort_idx = cp.argsort(-valid_sims)[:top_n_reasons]
+            
+            valid_inners_cpu = valid_inners_arr[sort_idx].get()
+            valid_sims_cpu = valid_sims[sort_idx].get()
+            cp.get_default_memory_pool().free_all_blocks()
+            
+            return [
+                {
+                    'movie_id': self._inner_to_raw_item[valid_inners_cpu[idx]],
+                    'similarity': float(valid_sims_cpu[idx])
+                }
+                for idx in range(len(sort_idx))
+            ]
+        else:
+            target_vector = self._qi[target_inner]
+            liked_vectors = self._qi[liked_inners]
+
+            norm_target = self._qi_norms[target_inner]
+            norm_liked = self._qi_norms[liked_inners]
+            
+            denom = norm_liked * norm_target
+            sims = np.dot(liked_vectors, target_vector) / denom
+            
+            valid_sim_mask = sims > 0
+            valid_sims = sims[valid_sim_mask]
+            valid_inners_arr = np.array(liked_inners)[valid_sim_mask]
+            
+            if len(valid_sims) == 0:
+                return []
+                
+            sort_idx = np.argsort(-valid_sims)[:top_n_reasons]
+            
+            return [
+                {
+                    'movie_id': self._inner_to_raw_item[valid_inners_arr[idx]],
+                    'similarity': float(valid_sims[idx])
+                }
+                for idx in sort_idx
+            ]
