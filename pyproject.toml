@@ -29,6 +29,8 @@ dependencies = [
     "seaborn",
     "tqdm",
     "uvicorn",
+    "numpy",
+    "scipy"
 ]
 
 [dependency-groups]

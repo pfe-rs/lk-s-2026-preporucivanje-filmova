@@ -71,7 +71,7 @@ def catalog_coverage(all_recommended: List[List[int]], total_items: int) -> floa
         return 0.0
     return len(unique_recommended) / total_items
 
-
+    
 def intra_list_diversity(
     recommended: List[int], item_features: Dict[int, np.ndarray]
 ) -> float:

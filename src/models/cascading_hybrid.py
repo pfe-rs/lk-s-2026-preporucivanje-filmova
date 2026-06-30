@@ -86,11 +86,19 @@ class CascadingHybridRecommender:
     @staticmethod
     def _rerank(scores: np.ndarray, candidates: List[int], k: int) -> List[int]:
         n = len(scores)
+        if n == 0:
+            return []
+
+        if np.all(scores == scores[0]):
+            return list(candidates[:k])
         if n > k:
+
             idx = np.argpartition(scores, -k)[-k:]
-            idx = idx[np.argsort(scores[idx])[::-1]]
+
+            idx = idx[np.argsort(-scores[idx])]
         else:
-            idx = np.argsort(scores)[::-1]
+            idx = np.argsort(-scores)
+            
         return [candidates[i] for i in idx]
 
     def fitted(
