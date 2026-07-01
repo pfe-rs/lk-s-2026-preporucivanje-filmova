@@ -1,7 +1,7 @@
 import time
 import numpy as np
 import pandas as pd
-from typing import List, Dict, Any, Optional
+from typing import List, Dict, Any, Optional, Set, Tuple
 from concurrent.futures import ThreadPoolExecutor
 
 from src.utils.logger import LoggingConfig, StepLogger
@@ -92,9 +92,7 @@ class CascadingHybridRecommender:
         if np.all(scores == scores[0]):
             return list(candidates[:k])
         if n > k:
-
             idx = np.argpartition(scores, -k)[-k:]
-
             idx = idx[np.argsort(-scores[idx])]
         else:
             idx = np.argsort(-scores)
@@ -134,15 +132,22 @@ class CascadingHybridRecommender:
             self._cache[key] = self.secondary_model.predict_scores(user_id, item_ids)
         return self._cache[key]
 
-    def get_top_k_recommendations(self, user_id: int, watched_items: set, k: int = 10) -> List[int]:
+    def get_top_k_recommendations(
+        self, user_id: int, watched_items: set, k: int = 10, valid_items: Optional[List[int]] = None
+    ) -> List[int]:
         t0, c0 = time.perf_counter(), time.process_time()
-        broad = self.primary_model.get_top_k_recommendations(
-            user_id=user_id, watched_items=watched_items, k=self.primary_k
-        )
+        
+        get_rec_kwargs = {"user_id": user_id, "watched_items": watched_items, "k": self.primary_k}
+        if valid_items is not None:
+            get_rec_kwargs["valid_items"] = valid_items
+
+        broad = self.primary_model.get_top_k_recommendations(**get_rec_kwargs)
         if not broad:
             return []
+            
         scores = np.asarray(self.secondary_model.predict_scores(user_id, broad), dtype=np.float32)
         result = self._rerank(scores, broad, k)
+        
         if self.config.log_per_prediction:
             self.step_logger.log_step("get_top_k_recommendations", t0, c0, {
                 "broad_candidates": len(broad),
@@ -225,20 +230,27 @@ class CascadingHybridRecommender:
         user_ids: List[int],
         watched_items_list: List[set],
         k: int = 10,
+        valid_items: Optional[List[List[int]]] = None
     ) -> List[List[int]]:
         if not user_ids:
             return []
 
-        fast_p = _cf_ready(self.primary_model)
+        fast_p = _cf_ready(self.primary_model) and (valid_items is None)
         fast_s = _cb_ready(self.secondary_model)
 
         if fast_p:
             broad = self._batch_primary_topk(user_ids, watched_items_list)
         else:
-            broad = [
-                self.primary_model.get_top_k_recommendations(u, w, self.primary_k)
-                for u, w in zip(user_ids, watched_items_list)
-            ]
+            if valid_items is not None:
+                broad = [
+                    self.primary_model.get_top_k_recommendations(u, w, self.primary_k, v)
+                    for u, w, v in zip(user_ids, watched_items_list, valid_items)
+                ]
+            else:
+                broad = [
+                    self.primary_model.get_top_k_recommendations(u, w, self.primary_k)
+                    for u, w in zip(user_ids, watched_items_list)
+                ]
 
         out: List[List[int]] = [[] for _ in range(len(user_ids))]
         ne = [(i, user_ids[i], broad[i]) for i in range(len(user_ids)) if broad[i]]

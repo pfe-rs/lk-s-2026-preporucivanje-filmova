@@ -1,6 +1,6 @@
 import pandas as pd
 import numpy as np
-from typing import List, Dict, Any
+from typing import List, Dict, Any, Optional
 
 
 class PopularityBaseline:
@@ -36,16 +36,28 @@ class PopularityBaseline:
         return scores.tolist()
 
     def get_top_k_recommendations(
-        self, user_id: int, watched_items: set, k: int = 10
+        self, user_id: int, watched_items: set, k: int = 10,
+        valid_items: Optional[List[int]] = None
     ) -> List[int]:
         if not self.is_fitted:
             raise RuntimeError("Model must be fitted before prediction.")
+
+        if valid_items is not None:
+            v_arr = np.asarray(valid_items, dtype=np.int64)
+            candidates = self._sorted_items[np.isin(self._sorted_items, v_arr)]
+        else:
+            candidates = self._sorted_items
+
+        if len(candidates) == 0:
+            return []
+
         if not watched_items:
-            return self._sorted_items_list[:k]
+            return candidates[:k].tolist()
+
         result = []
-        for mid in self._sorted_items_list:
+        for mid in candidates:
             if mid not in watched_items:
-                result.append(mid)
+                result.append(int(mid))
                 if len(result) == k:
                     break
         return result
@@ -55,18 +67,34 @@ class PopularityBaseline:
         user_ids: List[int],
         watched_items_list: List[set],
         k: int = 10,
+        valid_items: Optional[List[List[int]]] = None,
     ) -> List[List[int]]:
         if not self.is_fitted:
             raise RuntimeError("Model must be fitted before prediction.")
+        if not user_ids:
+            return []
+
         results = []
-        for watched in watched_items_list:
+        for i, watched in enumerate(watched_items_list):
+            v_items = valid_items[i] if valid_items is not None else None
+
+            if v_items is not None:
+                v_arr = np.asarray(v_items, dtype=np.int64)
+                candidates = self._sorted_items[np.isin(self._sorted_items, v_arr)]
+            else:
+                candidates = self._sorted_items
+
+            if len(candidates) == 0:
+                results.append([])
+                continue
+
             if not watched:
-                results.append(self._sorted_items_list[:k])
+                results.append(candidates[:k].tolist())
             else:
                 recs = []
-                for mid in self._sorted_items_list:
+                for mid in candidates:
                     if mid not in watched:
-                        recs.append(mid)
+                        recs.append(int(mid))
                         if len(recs) == k:
                             break
                 results.append(recs)

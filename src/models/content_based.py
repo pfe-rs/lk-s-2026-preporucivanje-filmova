@@ -10,8 +10,7 @@ from sklearn.feature_extraction.text import TfidfVectorizer
 import time
 import os
 from loguru import logger
-from tqdm import tqdm
-
+from tqdm.auto import tqdm
 
 @dataclass
 class ContentBasedConfig:
@@ -31,7 +30,6 @@ class ContentBasedConfig:
     top_k_default: int = 10
     pop_boost_weight: float = 0.05
     artifacts_dir: str = "data/processed/artifacts"
-    use_gpu: bool = True
     show_progress_bars: bool = True
 
 
@@ -253,8 +251,6 @@ class ContentBasedRecommender:
             end = min(start + batch_size, n_items)
             current_batch_size = end - start
             
-            logger.debug(f"Processing block {block_idx}/{total_blocks}: items {start}-{end-1}")
-            
             S_sparse = features_norm[start:end].dot(features_norm_T)
             S_dense = S_sparse.toarray().astype(np.float32)
             
@@ -286,12 +282,6 @@ class ContentBasedRecommender:
             block_elapsed = time.time() - block_start_time
             total_elapsed = time.time() - start_time_total
             eta = (total_elapsed / block_idx) * (total_blocks - block_idx)
-            
-            logger.info(
-                f"Block {block_idx}/{total_blocks} completed in {block_elapsed:.2f}s. "
-                f"Total: {total_elapsed:.2f}s, ETA: {eta:.2f}s, "
-                f"Speed: {current_batch_size / block_elapsed:.1f} items/s"
-            )
                 
         total_elapsed = time.time() - start_time_total
         logger.info(f"Similarity computation completed in {total_elapsed:.2f}s")

@@ -2,6 +2,7 @@ import pandas as pd
 import numpy as np
 from typing import Dict, List
 from sklearn.model_selection import train_test_split
+
 class DataSplitter:
     def __init__(self, ratings_df: pd.DataFrame, relevance_threshold: float = 3.0):
         self.relevance_threshold = relevance_threshold
@@ -10,7 +11,6 @@ class DataSplitter:
         self.df_time = ratings_df.sort_values(by='timestamp').reset_index(drop=True)
 
     def _apply_cold_start_filters(self, train_df: pd.DataFrame, val_df: pd.DataFrame, test_df: pd.DataFrame) -> Dict[str, pd.DataFrame]:
-
         trained_items = set(train_df[self.item_col].unique())
         trained_users = set(train_df['userId'].unique())
 
@@ -27,6 +27,7 @@ class DataSplitter:
             ].reset_index(drop=True)
 
         return {'train': train_df, 'val': val_df, 'test': test_df}
+
     def hybrid_stratified_split(self, random_state: int = 42) -> Dict[str, pd.DataFrame]:
         df_shuffled = self.df_user_time.sample(frac=1, random_state=random_state).reset_index(drop=True)
         df = df_shuffled.sort_values(by='userId', kind='stable').reset_index(drop=True)
@@ -47,8 +48,10 @@ class DataSplitter:
         mask_1 = group_sizes == 1
         
         test_val_counts = np.round(group_sizes * 0.30).astype(np.int64)
-        val_counts_ge_6 = test_val_counts // 2
-        test_counts_ge_6 = test_val_counts - val_counts_ge_6
+        
+        ge6_test_val = test_val_counts[mask_ge_6]
+        val_counts_ge_6 = ge6_test_val // 2
+        test_counts_ge_6 = ge6_test_val - val_counts_ge_6
         
         train_counts[mask_ge_6] = group_sizes[mask_ge_6] - val_counts_ge_6 - test_counts_ge_6
         val_counts[mask_ge_6] = val_counts_ge_6
@@ -74,6 +77,7 @@ class DataSplitter:
         test_df = df[test_mask].copy().reset_index(drop=True)
 
         return self._apply_cold_start_filters(train_df, val_df, test_df)
+
     def _group_boundaries(self, ids: np.ndarray):
         n_rows = len(ids)
         diff = ids[:-1] != ids[1:]

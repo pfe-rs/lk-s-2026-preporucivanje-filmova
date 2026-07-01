@@ -30,7 +30,8 @@ dependencies = [
     "tqdm",
     "uvicorn",
     "numpy",
-    "scipy"
+    "scipy",
+    "cffi>=2.0.0",
 ]
 
 [dependency-groups]
